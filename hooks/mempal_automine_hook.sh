@@ -11,7 +11,7 @@
 # 3. mempalace's built-in mtime tracking skips unchanged files
 # 4. Returns empty JSON — never blocks the AI
 
-MINE_INTERVAL=3600  # seconds between mines (3600 = 1 hour)
+MINE_INTERVAL=300  # seconds between mines (5 min cooldown to avoid rapid re-mining)
 STATE_DIR="$HOME/.mempalace/hook_state"
 LAST_MINE_FILE="$STATE_DIR/last_automine"
 MINE_LOG="$STATE_DIR/automine.log"
@@ -36,8 +36,11 @@ if [ "$ELAPSED" -ge "$MINE_INTERVAL" ]; then
     echo "$NOW" > "$LAST_MINE_FILE"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Auto-mining conversations from $CONVOS_DIR" >> "$MINE_LOG"
 
-    # Run in background, detached from this process
-    nohup "$VENV_PYTHON" -m mempalace mine "$CONVOS_DIR" --mode convos >> "$MINE_LOG" 2>&1 &
+    # Run in background: mine then notify
+    (
+        "$VENV_PYTHON" -m mempalace mine "$CONVOS_DIR" --mode convos >> "$MINE_LOG" 2>&1
+        osascript -e 'display notification "Session indexed" with title "MemPalace" sound name "Purr"' 2>/dev/null
+    ) &
 
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Mining started (PID: $!)" >> "$MINE_LOG"
 fi
