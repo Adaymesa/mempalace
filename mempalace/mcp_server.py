@@ -23,6 +23,20 @@ Tools (maintenance):
 import os
 import sys
 
+# --- Maintenance kill-switch ---------------------------------------------
+# If ~/.mempalace/MCP_DISABLED exists, exit immediately before importing
+# chromadb. Used during HNSW rebuild / corruption recovery to prevent fresh
+# MCP server processes from segfaulting on a known-bad palace state. The
+# MCP transport reports the server as unavailable; client tools surface a
+# clear "tool unavailable" error instead of a SIGSEGV crash report.
+_MCP_DISABLED_FLAG = os.path.expanduser("~/.mempalace/MCP_DISABLED")
+if os.path.exists(_MCP_DISABLED_FLAG):
+    sys.stderr.write(
+        f"MemPalace MCP server disabled by sentinel: {_MCP_DISABLED_FLAG}\n"
+        f"Remove that file to re-enable.\n"
+    )
+    sys.exit(1)
+
 # --- MCP stdio protection (issue #225) -----------------------------------
 # The MCP protocol multiplexes JSON-RPC over stdio: stdout MUST carry only
 # valid JSON-RPC messages, stderr is for human-readable logs. Some
@@ -215,6 +229,216 @@ def _wal_log(operation: str, params: dict, result: dict = None):
             f.write(json.dumps(entry, default=str) + "\n")
     except Exception as e:
         logger.error(f"WAL write failed: {e}")
+
+
+# ==================== CORRUPTION DETECTION ====================
+# When SQLite/Chroma reports "database disk image is malformed" or similar,
+# the existing handler returned a generic {"success": false} that was easy
+# to miss. We now (a) flag corruption to a sentinel file, (b) trigger a
+# desktop notification, and (c) refuse subsequent writes until the operator
+# clears the flag. This prevents silent multi-write data loss.
+
+_CORRUPTION_FLAG = Path(os.path.expanduser("~/.mempalace/CORRUPTION_DETECTED"))
+
+_CORRUPTION_MARKERS = (
+    "malformed",
+    "disk image is malformed",
+    "disk i/o error",
+    "is not a database",
+    "database is corrupt",
+)
+
+
+def _is_corruption_error(err) -> bool:
+    msg = str(err).lower()
+    return any(m in msg for m in _CORRUPTION_MARKERS)
+
+
+def _flag_corruption(originating_error) -> dict:
+    """Write the corruption sentinel + integrity check report. Idempotent."""
+    integrity_output = "(could not run integrity check)"
+    try:
+        import subprocess
+
+        db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+        proc = subprocess.run(
+            ["sqlite3", db_path, "PRAGMA integrity_check;"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        integrity_output = (proc.stdout or proc.stderr or "(empty)").strip()[:5000]
+    except Exception as e:
+        integrity_output = f"(integrity check failed: {e})"
+
+    report = {
+        "detected_at": datetime.now().isoformat(),
+        "originating_error": str(originating_error),
+        "integrity_check": integrity_output,
+        "palace_path": _config.palace_path,
+    }
+    try:
+        _CORRUPTION_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        _CORRUPTION_FLAG.write_text(
+            "MemPalace detected database corruption. Writes are blocked until "
+            "this file is removed.\n\n"
+            f"{json.dumps(report, indent=2, default=str)}\n",
+            encoding="utf-8",
+        )
+        try:
+            _CORRUPTION_FLAG.chmod(0o600)
+        except OSError:
+            pass
+    except Exception as e:
+        logger.error(f"Failed to write corruption sentinel: {e}")
+
+    # Best-effort macOS desktop notification — non-blocking, fire-and-forget.
+    try:
+        import subprocess
+
+        subprocess.Popen(
+            [
+                "osascript",
+                "-e",
+                'display notification "Database corruption detected — writes blocked. '
+                'See ~/.mempalace/CORRUPTION_DETECTED" with title "MemPalace" sound name "Basso"',
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+    logger.error(f"MemPalace corruption detected. Writes are now blocked. See {_CORRUPTION_FLAG}")
+    return report
+
+
+def _corruption_blocked():
+    """If the corruption sentinel exists, return a structured error to surface to callers."""
+    if _CORRUPTION_FLAG.exists():
+        try:
+            content = _CORRUPTION_FLAG.read_text(encoding="utf-8")
+        except Exception:
+            content = "(sentinel exists but unreadable)"
+        return {
+            "success": False,
+            "error": "MemPalace is in safety mode: database corruption was detected. "
+            "Writes are blocked.",
+            "sentinel_path": str(_CORRUPTION_FLAG),
+            "sentinel_excerpt": content[:1000],
+            "next_steps": [
+                "Run: sqlite3 ~/.mempalace/palace/chroma.sqlite3 'PRAGMA integrity_check;'",
+                "Restore from a clean backup in "
+                "~/Library/Mobile Documents/com~apple~CloudDocs/Backups/mempalace/",
+                "After recovery, remove the sentinel: rm ~/.mempalace/CORRUPTION_DETECTED",
+            ],
+        }
+    return None
+
+
+# ==================== OUTBOX (full-content recovery store) ====================
+# The WAL above redacts content to 200 chars for privacy/log-size reasons,
+# which makes it useless as a recovery source after DB corruption. The
+# outbox stores the full verbatim payload of every add_drawer attempt, so
+# failed writes can be replayed verbatim. Successful writes are moved to a
+# committed/ subtree with a retention policy (default 14 days). Set
+# MEMPALACE_OUTBOX_DISABLED=1 to opt out (privacy-conscious deployments).
+
+_OUTBOX_DIR = Path(os.path.expanduser("~/.mempalace/wal/outbox"))
+_OUTBOX_COMMITTED_DIR = Path(os.path.expanduser("~/.mempalace/wal/outbox-committed"))
+_OUTBOX_RETAIN_DAYS = int(os.environ.get("MEMPALACE_OUTBOX_RETAIN_DAYS", "14"))
+_OUTBOX_DISABLED = os.environ.get("MEMPALACE_OUTBOX_DISABLED", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _outbox_pending_path(drawer_id: str) -> Path:
+    day = datetime.now().strftime("%Y-%m-%d")
+    return _OUTBOX_DIR / day / f"{drawer_id}.json"
+
+
+def _outbox_write(drawer_id: str, payload: dict) -> Optional[Path]:
+    """Persist full payload to outbox before attempting DB write. Returns path on success."""
+    if _OUTBOX_DISABLED:
+        return None
+    try:
+        target = _outbox_pending_path(drawer_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.chmod(0o700)
+        except OSError:
+            pass
+        tmp = target.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(
+                {"timestamp": datetime.now().isoformat(), **payload},
+                f,
+                ensure_ascii=False,
+                default=str,
+            )
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.rename(tmp, target)
+        return target
+    except Exception as e:
+        logger.error(f"Outbox write failed (DB write will still be attempted): {e}")
+        return None
+
+
+def _outbox_commit(outbox_file: Optional[Path]) -> None:
+    """Move pending outbox file to committed/ after successful DB write."""
+    if outbox_file is None or not outbox_file.exists():
+        return
+    try:
+        committed = _OUTBOX_COMMITTED_DIR / outbox_file.parent.name / outbox_file.name
+        committed.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            committed.parent.chmod(0o700)
+        except OSError:
+            pass
+        os.rename(outbox_file, committed)
+    except Exception as e:
+        logger.error(f"Outbox commit failed: {e}")
+
+
+def _outbox_sweep() -> None:
+    """Delete committed outbox entries older than retention. Best-effort, idempotent."""
+    if not _OUTBOX_COMMITTED_DIR.exists():
+        return
+    import shutil as _shutil
+
+    cutoff = time.time() - (_OUTBOX_RETAIN_DAYS * 86400)
+    try:
+        for day_dir in _OUTBOX_COMMITTED_DIR.iterdir():
+            if not day_dir.is_dir():
+                continue
+            try:
+                day_dt = datetime.strptime(day_dir.name, "%Y-%m-%d").timestamp()
+            except ValueError:
+                continue
+            if day_dt < cutoff:
+                _shutil.rmtree(day_dir, ignore_errors=True)
+    except Exception as e:
+        logger.error(f"Outbox sweep failed: {e}")
+
+
+# Run sweep once at module import (cheap, idempotent).
+try:
+    _outbox_sweep()
+except Exception:
+    pass
+
+
+# ==================== INTER-PROCESS WRITE LOCK ====================
+# Shared with miner.py via mempalace._write_lock so that all chroma
+# writers (MCP server upsert/delete + miner batch upserts) serialize
+# against the same flock and cannot interleave HNSW/FTS5 maintenance.
+
+from ._write_lock import write_lock as _write_lock  # noqa: E402
 
 
 def _get_client():
@@ -796,6 +1020,12 @@ def tool_add_drawer(
 ):
     """File verbatim content into a wing/room. Checks for duplicates first."""
     global _metadata_cache
+
+    # Refuse writes if corruption was previously flagged — fail fast and loudly.
+    blocked = _corruption_blocked()
+    if blocked:
+        return blocked
+
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
@@ -809,6 +1039,20 @@ def tool_add_drawer(
 
     drawer_id = (
         f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
+    )
+
+    # Outbox: persist verbatim full content BEFORE attempting DB write so a
+    # subsequent corruption/crash leaves a recoverable record on disk.
+    outbox_file = _outbox_write(
+        drawer_id,
+        {
+            "drawer_id": drawer_id,
+            "wing": wing,
+            "room": room,
+            "content": content,
+            "source_file": source_file or "",
+            "added_by": added_by,
+        },
     )
 
     _wal_log(
@@ -827,39 +1071,90 @@ def tool_add_drawer(
     try:
         existing = col.get(ids=[drawer_id])
         if existing and existing["ids"]:
+            _outbox_commit(outbox_file)
             return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
-    except Exception:
-        pass
+    except Exception as e:
+        if _is_corruption_error(e):
+            report = _flag_corruption(e)
+            return {
+                "success": False,
+                "error": "MemPalace database corruption detected during read — writes blocked.",
+                "originating_error": str(e),
+                "integrity_check": report.get("integrity_check"),
+                "outbox_path": str(outbox_file) if outbox_file else None,
+                "next_steps": [
+                    "Inspect ~/.mempalace/CORRUPTION_DETECTED",
+                    "Restore from a clean backup",
+                    "Remove sentinel after recovery",
+                ],
+            }
 
     try:
-        col.upsert(
-            ids=[drawer_id],
-            documents=[content],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": room,
-                    "source_file": source_file or "",
-                    "chunk_index": 0,
-                    "added_by": added_by,
-                    "filed_at": datetime.now().isoformat(),
-                }
-            ],
-        )
-        _metadata_cache = None
+        with _write_lock():
+            col.upsert(
+                ids=[drawer_id],
+                documents=[content],
+                metadatas=[
+                    {
+                        "wing": wing,
+                        "room": room,
+                        "source_file": source_file or "",
+                        "chunk_index": 0,
+                        "added_by": added_by,
+                        "filed_at": datetime.now().isoformat(),
+                    }
+                ],
+            )
+            _metadata_cache = None
+        _outbox_commit(outbox_file)
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
         return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        if _is_corruption_error(e):
+            report = _flag_corruption(e)
+            return {
+                "success": False,
+                "error": "MemPalace database corruption detected on write — writes blocked. "
+                "Verbatim content preserved in outbox for replay after recovery.",
+                "originating_error": str(e),
+                "integrity_check": report.get("integrity_check"),
+                "outbox_path": str(outbox_file) if outbox_file else None,
+                "next_steps": [
+                    "Inspect ~/.mempalace/CORRUPTION_DETECTED",
+                    "Restore from a clean backup",
+                    "Remove sentinel; outbox/ files will replay on next add_drawer or via mempalace.outbox_recover",
+                ],
+            }
+        return {
+            "success": False,
+            "error": str(e),
+            "outbox_path": str(outbox_file) if outbox_file else None,
+        }
 
 
 def tool_delete_drawer(drawer_id: str):
     """Delete a single drawer by ID."""
     global _metadata_cache
+
+    blocked = _corruption_blocked()
+    if blocked:
+        return blocked
+
     col = _get_collection()
     if not col:
         return _no_palace()
-    existing = col.get(ids=[drawer_id])
+    try:
+        existing = col.get(ids=[drawer_id])
+    except Exception as e:
+        if _is_corruption_error(e):
+            report = _flag_corruption(e)
+            return {
+                "success": False,
+                "error": "MemPalace database corruption detected during read — writes blocked.",
+                "originating_error": str(e),
+                "integrity_check": report.get("integrity_check"),
+            }
+        raise
     if not existing["ids"]:
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
@@ -876,11 +1171,20 @@ def tool_delete_drawer(drawer_id: str):
     )
 
     try:
-        col.delete(ids=[drawer_id])
-        _metadata_cache = None
+        with _write_lock():
+            col.delete(ids=[drawer_id])
+            _metadata_cache = None
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
     except Exception as e:
+        if _is_corruption_error(e):
+            report = _flag_corruption(e)
+            return {
+                "success": False,
+                "error": "MemPalace database corruption detected on delete — writes blocked.",
+                "originating_error": str(e),
+                "integrity_check": report.get("integrity_check"),
+            }
         return {"success": False, "error": str(e)}
 
 

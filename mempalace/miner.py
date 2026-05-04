@@ -17,6 +17,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from ._write_lock import write_lock as _write_lock
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -780,11 +781,12 @@ def add_drawer(
     metadata = _build_drawer_metadata(
         wing, room, source_file, chunk_index, agent, content, source_mtime
     )
-    collection.upsert(
-        documents=[content],
-        ids=[drawer_id],
-        metadatas=[metadata],
-    )
+    with _write_lock():
+        collection.upsert(
+            documents=[content],
+            ids=[drawer_id],
+            metadatas=[metadata],
+        )
     return True
 
 
@@ -873,11 +875,12 @@ def process_file(
                         source_mtime,
                     )
                 )
-            collection.upsert(
-                documents=batch_docs,
-                ids=batch_ids,
-                metadatas=batch_metas,
-            )
+            with _write_lock():
+                collection.upsert(
+                    documents=batch_docs,
+                    ids=batch_ids,
+                    metadatas=batch_metas,
+                )
             drawers_added += len(batch_docs)
 
         # Build closet — the searchable index pointing to these drawers.
